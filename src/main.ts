@@ -1,554 +1,581 @@
 /*
- * BK215 Battery Storage adapter for ioBroker.
+ * BK215 / SunEnergyXT adapter for ioBroker — cloud reader.
  *
- * Iteration 3 — controller, safety, scheduler wired in.
- *   ✓ BK215Client (TCP + protocol)
- *   ✓ GridReader (foreign-state subscription, EWMA smoothing, freshness)
- *   ✓ PIController (position-form PI, anti-windup, deadband, hysteresis)
- *   ✓ SafetyGuard (composite watchdog → fail-safe verdict)
- *   ✓ ZeroFeedScheduler (orchestrator with re-entrancy guard)
- *   ✓ Persistence of integral term across restarts
+ * Reads battery, solar, inverter and energy statistics from the SunEnergyXT
+ * (formerly Sunlit Solar) cloud with the app login. Read-only: the adapter
+ * never changes anything on the battery, the app stays in charge (no local
+ * mode needed).
  *
- * Still to come:
- *   - jsonConfig admin UI (Iteration 4)
- *   - mDNS auto-discovery (Iteration 4)
- *   - GitHub Actions CI + adapter-checker (Iteration 5)
+ * Two loops:
+ *   - live  (default 60 s):  space index + battery statistics → live.*
+ *   - stats (default 15 min): energy/earning per year, month, day, intraday curve → stats.*, today.*
  */
 
 import * as utils from "@iobroker/adapter-core";
 
+import { redact, redactJson } from "./lib/redact";
+import { CloudAuthError, SunlitCloud } from "./lib/sunlit-cloud";
 import {
-  BK215Client,
-  BK215CommandError,
-  type Logger,
-  type StatusSnapshot,
-} from "./lib/bk215-client";
-import { BK215Discovery, type DiscoveredDevice } from "./lib/bk215-discovery";
-import { Field, isAvailable } from "./lib/bk215-protocol";
-import { GridReader } from "./lib/grid-reader";
-import { PIController } from "./lib/pi-controller";
-import { ZeroFeedScheduler, type TickReport } from "./lib/zero-feed-scheduler";
+  batteries,
+  batteryEta,
+  buckets,
+  dayCurve,
+  liveValues,
+  num,
+  periodTotals,
+} from "./lib/sunlit-map";
 
-interface BK215AdapterConfig {
-  bk215Host: string;
-  bk215Port: number;
-  bk215Serial: string;
-  bk215ConnectTimeoutMs: number;
-  bk215ResponseTimeoutMs: number;
-  bk215IdleTimeoutMs: number;
-  enableMdnsDiscovery: boolean;
-
-  gridStatePath: string;
-  gridStaleTimeoutS: number;
-
-  controllerEnabled: boolean;
-  controllerIntervalMs: number;
-  controllerKp: number;
-  controllerKi: number;
-  controllerDeadbandW: number;
-  controllerTargetGridW: number;
-
-  inverterMaxPowerW: number;
-  socMin: number;
-  socMax: number;
-  socSafetyBuffer: number;
-
-  enableApsInverter: boolean;
-  apsInverterHost: string;
-
-  cloudApiToken: string;
-
-  logLevel: string;
+interface AdapterConfig {
+  cloudEmail: string;
+  cloudPassword: string;
+  familyId: number;
+  pollLiveS: number;
+  pollStatsMin: number;
+  batteryCapacityKwh: number;
+  minSoc: number;
 }
 
+/** capacity of one BK215 / B215 module */
+const MODULE_KWH = 2.15;
+const MAX_BACKOFF_MS = 10 * 60_000;
+const SENSITIVE = [
+  "token",
+  "access_token",
+  "accessToken",
+  "refresh_token",
+  "password",
+  "authorization",
+  "Authorization",
+  "account",
+  "email",
+  "mobile",
+  "phone",
+];
+
+type Json = Record<string, unknown>;
+
+interface StateDef {
+  name: string;
+  type: ioBroker.CommonType;
+  role: string;
+  unit?: string;
+}
+
+const STATES: Record<string, StateDef> = {
+  "info.lastSync": {
+    name: "Last successful cloud read",
+    type: "number",
+    role: "value.time",
+  },
+  "info.lastError": { name: "Last cloud error", type: "string", role: "text" },
+  "info.familyId": { name: "Space / family id", type: "number", role: "value" },
+  "live.soc": {
+    name: "Battery level",
+    type: "number",
+    role: "value.battery",
+    unit: "%",
+  },
+  "live.batteryW": {
+    name: "Battery power (+ charging / - discharging)",
+    type: "number",
+    role: "value.power",
+    unit: "W",
+  },
+  "live.batteryChargeW": {
+    name: "Battery charging power",
+    type: "number",
+    role: "value.power",
+    unit: "W",
+  },
+  "live.batteryDischargeW": {
+    name: "Battery discharging power",
+    type: "number",
+    role: "value.power",
+    unit: "W",
+  },
+  "live.solarW": {
+    name: "Solar power (MPPT inputs)",
+    type: "number",
+    role: "value.power",
+    unit: "W",
+  },
+  "live.inverterW": {
+    name: "Inverter output",
+    type: "number",
+    role: "value.power",
+    unit: "W",
+  },
+  "live.meterW": {
+    name: "Grid power from the meter in the app (+ import / - export)",
+    type: "number",
+    role: "value.power",
+    unit: "W",
+  },
+  "live.homeW": {
+    name: "Home consumption",
+    type: "number",
+    role: "value.power",
+    unit: "W",
+  },
+  "live.chargeRemainingMin": {
+    name: "Minutes until full (cloud)",
+    type: "number",
+    role: "value",
+    unit: "min",
+  },
+  "live.dischargeRemainingMin": {
+    name: "Minutes until empty (cloud)",
+    type: "number",
+    role: "value",
+    unit: "min",
+  },
+  "live.fullAt": {
+    name: "Expected full at",
+    type: "number",
+    role: "value.time",
+  },
+  "live.emptyAt": {
+    name: "Expected empty at",
+    type: "number",
+    role: "value.time",
+  },
+  "live.batteryModules": {
+    name: "Battery modules",
+    type: "number",
+    role: "value",
+  },
+  "live.batteryStatus": {
+    name: "Battery status",
+    type: "string",
+    role: "text",
+  },
+  "live.batteryFault": {
+    name: "Battery fault",
+    type: "boolean",
+    role: "indicator.maintenance",
+  },
+  "live.capacityKwh": {
+    name: "Battery capacity used for estimates",
+    type: "number",
+    role: "value",
+    unit: "kWh",
+  },
+  "today.solarKwh": {
+    name: "Solar yield today",
+    type: "number",
+    role: "value.energy",
+    unit: "kWh",
+  },
+  "today.earning": { name: "Earnings today", type: "number", role: "value" },
+  "today.currency": { name: "Currency", type: "string", role: "text" },
+  "today.curve": {
+    name: "Intraday curve [{t, solarW, homeW, batteryInW, batteryOutW}]",
+    type: "string",
+    role: "json",
+  },
+  "stats.total": {
+    name: "Lifetime totals {yieldKwh, earnings, ...}",
+    type: "string",
+    role: "json",
+  },
+  "stats.years": {
+    name: "Per year [{key: year, ...}]",
+    type: "string",
+    role: "json",
+  },
+  "stats.yearTotals": {
+    name: "Totals all time {yieldKwh, consumptionKwh, selfUseRate, ...}",
+    type: "string",
+    role: "json",
+  },
+  "stats.months": {
+    name: "This year per month [{key: month, ...}]",
+    type: "string",
+    role: "json",
+  },
+  "stats.monthTotals": {
+    name: "This year totals",
+    type: "string",
+    role: "json",
+  },
+  "stats.days": {
+    name: "This month per day [{key: day, ...}]",
+    type: "string",
+    role: "json",
+  },
+  "stats.dayTotals": {
+    name: "This month totals",
+    type: "string",
+    role: "json",
+  },
+  "stats.daysPrev": {
+    name: "Previous month per day (for the week Mon–Sun)",
+    type: "string",
+    role: "json",
+  },
+  "stats.updated": {
+    name: "Statistics read at",
+    type: "number",
+    role: "value.time",
+  },
+  "raw.families": {
+    name: "Raw cloud answer (redacted)",
+    type: "string",
+    role: "json",
+  },
+  "raw.devices": {
+    name: "Raw cloud answer (redacted)",
+    type: "string",
+    role: "json",
+  },
+  "raw.index": {
+    name: "Raw cloud answer (redacted)",
+    type: "string",
+    role: "json",
+  },
+  "raw.batteryStats": {
+    name: "Raw cloud answer (redacted)",
+    type: "string",
+    role: "json",
+  },
+  "raw.energyMonth": {
+    name: "Raw cloud answer (redacted)",
+    type: "string",
+    role: "json",
+  },
+  "raw.earningMonth": {
+    name: "Raw cloud answer (redacted)",
+    type: "string",
+    role: "json",
+  },
+  "raw.dayPower": {
+    name: "Raw cloud answer (redacted)",
+    type: "string",
+    role: "json",
+  },
+  "raw.batteryIo": {
+    name: "Raw cloud answer (redacted)",
+    type: "string",
+    role: "json",
+  },
+};
+
 class Bk215Adapter extends utils.Adapter {
-  private bk215: BK215Client | null = null;
-  private grid: GridReader | null = null;
-  private controller: PIController | null = null;
-  private scheduler: ZeroFeedScheduler | null = null;
+  private cloud: SunlitCloud | null = null;
+  private familyId = 0;
+  private batteryIds: number[] = [];
+  private capacityKwh = 0;
+  private liveTimer: ioBroker.Timeout | undefined;
+  private statsTimer: ioBroker.Timeout | undefined;
+  private liveFails = 0;
+  private statsFails = 0;
+  private lastErrorLogged = "";
 
   public constructor(options: Partial<utils.AdapterOptions> = {}) {
-    super({
-      ...options,
-      name: "bk215",
-      useFormatDate: true,
-    });
-
+    super({ ...options, name: "bk215" });
     this.on("ready", this.onReady.bind(this));
-    this.on("stateChange", this.onStateChange.bind(this));
     this.on("unload", this.onUnload.bind(this));
   }
 
-  private get cfg(): BK215AdapterConfig {
-    return this.config as unknown as BK215AdapterConfig;
+  private get cfg(): AdapterConfig {
+    return this.config as unknown as AdapterConfig;
   }
-
-  private get clientLogger(): Logger {
-    return {
-      debug: (msg) => this.log.debug(`[bk215] ${msg}`),
-      info: (msg) => this.log.info(`[bk215] ${msg}`),
-      warn: (msg) => this.log.warn(`[bk215] ${msg}`),
-      error: (msg) => this.log.error(`[bk215] ${msg}`),
-    };
-  }
-
-  /**
-   * Build a TimerService backed by `this.setTimeout` / `this.clearTimeout`.
-   * The adapter base class tracks these handles and auto-clears them on
-   * unload — which is what makes the client Compact-Mode-safe.
-   *
-   * Note on the cast: ioBroker's `setTimeout` typing returns
-   * `ioBroker.Timeout | undefined`. We wrap it so consumers see a
-   * Node-style `NodeJS.Timeout` and don't have to deal with `undefined`.
-   * In practice, ioBroker only returns undefined when the adapter is
-   * already shutting down — at that point our timer wouldn't fire anyway.
-   */
-  private adapterTimerService(): {
-    setTimeout(handler: () => void, ms: number): NodeJS.Timeout;
-    clearTimeout(handle: NodeJS.Timeout): void;
-  } {
-    return {
-      setTimeout: (handler, ms) =>
-        this.setTimeout(handler, ms) as unknown as NodeJS.Timeout,
-      clearTimeout: (handle) =>
-        this.clearTimeout(handle as unknown as ioBroker.Timeout),
-    };
-  }
-
-  // -----------------------------------------------------------------------
-  // Lifecycle
-  // -----------------------------------------------------------------------
 
   private async onReady(): Promise<void> {
     await this.setStateAsync("info.connection", { val: false, ack: true });
+    await this.createStates();
 
-    this.log.info(`BK215 adapter starting up (instance ${this.namespace})`);
-
-    let resolvedHost = this.cfg.bk215Host;
-    if (!resolvedHost) {
-      if (this.cfg.enableMdnsDiscovery) {
-        this.log.info(
-          "No BK215 host configured — attempting mDNS discovery (10s)…",
-        );
-        resolvedHost = await this.discoverBk215Host();
-        if (resolvedHost) {
-          this.log.info(`Discovered BK215 at ${resolvedHost}`);
-        } else {
-          // Hard misconfig: no host AND nothing on the LAN. Exit cleanly with
-          // ioBroker's documented "missing config" code so js-controller
-          // doesn't auto-restart us in a tight loop.
-          this.terminate?.(
-            "No BK215 host configured and mDNS discovery found no device. Open the adapter settings and enter the IP manually.",
-            11,
-          );
-          return;
-        }
-      } else {
-        this.terminate?.(
-          "No BK215 host configured and mDNS discovery is disabled. Open the adapter settings and configure either.",
-          11,
-        );
-        return;
-      }
-    }
-
-    // Subscribe to writable own-namespace states.
-    this.subscribeStates("battery.chargingPowerSetpoint");
-    this.subscribeStates("battery.localMode");
-    this.subscribeStates("battery.homeApplianceMode");
-    this.subscribeStates("battery.socMinLimit");
-    this.subscribeStates("battery.socMaxLimit");
-    this.subscribeStates("controller.enabled");
-
-    // BK215 client.
-    // Inject `this.setTimeout` / `this.clearTimeout` so all timers inside
-    // the client are auto-cancelled on adapter unload (Compact-Mode-safe).
-    this.bk215 = new BK215Client({
-      host: resolvedHost,
-      port: this.cfg.bk215Port,
-      logger: this.clientLogger,
-      connectTimeoutMs: this.cfg.bk215ConnectTimeoutMs,
-      responseTimeoutMs: this.cfg.bk215ResponseTimeoutMs,
-      idleTimeoutMs: this.cfg.bk215IdleTimeoutMs,
-      timerService: this.adapterTimerService(),
-    });
-    this.wireBk215Events(resolvedHost);
-
-    try {
-      await this.bk215.connect();
-    } catch (err) {
-      this.log.warn(
-        `Initial connect attempt failed: ${(err as Error).message} — will keep retrying`,
-      );
-    }
-
-    // Grid reader (only if a grid state was configured).
-    if (this.cfg.gridStatePath) {
-      try {
-        this.grid = new GridReader({
-          stateId: this.cfg.gridStatePath,
-          bus: this,
-          logger: {
-            debug: (m) => this.log.debug(`[grid] ${m}`),
-            warn: (m) => this.log.warn(`[grid] ${m}`),
-          },
-        });
-        this.grid.on("update", (snap) => {
-          void this.setStateAsync("grid.power", {
-            val: snap.powerW,
-            ack: true,
-          });
-          void this.setStateAsync("grid.lastUpdate", {
-            val: snap.lastUpdateMs,
-            ack: true,
-          });
-          void this.setStateAsync("grid.stale", { val: false, ack: true });
-        });
-        await this.grid.start();
-        this.log.info(`Grid reader subscribed to ${this.cfg.gridStatePath}`);
-      } catch (err) {
-        this.log.error(
-          `Grid reader could not start: ${(err as Error).message}`,
-        );
-        this.grid = null;
-      }
-    } else {
-      this.log.info(
-        "No grid-state path configured — controller will stay disabled.",
-      );
-    }
-
-    // PI controller — restore persisted integral from previous run.
-    const persistedIntegral = await this.readNumber("controller.integral", 0);
-    const persistedOutput = await this.readNumber("battery.chargingPower", 0);
-
-    try {
-      this.controller = new PIController({
-        kp: this.cfg.controllerKp,
-        ki: this.cfg.controllerKi,
-        outMin: 0,
-        outMax: this.cfg.inverterMaxPowerW,
-        deadbandW: this.cfg.controllerDeadbandW,
-        minChangeW: Math.max(1, Math.round(this.cfg.inverterMaxPowerW * 0.001)),
-        initialIntegral: persistedIntegral,
-        initialOutput: persistedOutput,
-      });
-    } catch (err) {
+    const { cloudEmail, cloudPassword } = this.cfg;
+    if (!cloudEmail || !cloudPassword) {
       this.log.error(
-        `PI controller config invalid: ${(err as Error).message} — controller disabled`,
+        "Sunlit-Cloud: E-Mail und Passwort in den Adapter-Einstellungen eintragen",
       );
-      this.controller = null;
-    }
-
-    // Scheduler — only assembled if the necessary parts are all here.
-    if (this.bk215 && this.grid && this.controller) {
-      this.scheduler = new ZeroFeedScheduler({
-        bk215: this.bk215,
-        grid: this.grid,
-        controller: this.controller,
-        safetyConfig: {
-          gridStaleTimeoutS: this.cfg.gridStaleTimeoutS,
-          bk215StaleTimeoutS: Math.max(
-            15,
-            Math.round(this.cfg.bk215IdleTimeoutMs / 1000),
-          ),
-          socMin: this.cfg.socMin,
-          socMax: this.cfg.socMax,
-          socSafetyBufferPp: this.cfg.socSafetyBuffer,
-        },
-        targetGridW: this.cfg.controllerTargetGridW,
-        intervalMs: this.cfg.controllerIntervalMs,
-        logger: {
-          debug: (m) => this.log.debug(`[ctrl] ${m}`),
-          info: (m) => this.log.info(`[ctrl] ${m}`),
-          warn: (m) => this.log.warn(`[ctrl] ${m}`),
-          error: (m) => this.log.error(`[ctrl] ${m}`),
-        },
-        sink: {
-          onTick: (r) => this.onSchedulerTick(r),
-          onFailSafeChange: (active, _id, text) =>
-            this.onFailSafeChange(active, text),
-        },
-      });
-
-      // Honour the configured controllerEnabled flag.
-      await this.setStateAsync("controller.enabled", {
-        val: this.cfg.controllerEnabled,
-        ack: true,
-      });
-      if (this.cfg.controllerEnabled) {
-        this.scheduler.start();
-      }
-    }
-  }
-
-  private wireBk215Events(host: string): void {
-    if (!this.bk215) {
       return;
     }
-
-    this.bk215.on("open", () => {
-      void this.setStateAsync("info.connection", { val: true, ack: true });
-      this.log.info(`Connected to BK215 at ${host}:${this.cfg.bk215Port}`);
+    this.cloud = new SunlitCloud({
+      email: cloudEmail.trim(),
+      password: cloudPassword,
+      logger: { debug: (m) => this.log.debug(`[cloud] ${m}`) },
     });
+    this.scheduleLive(0);
+    this.scheduleStats(5_000);
+  }
 
-    this.bk215.on("close", (reason) => {
-      void this.setStateAsync("info.connection", { val: false, ack: true });
-      this.log.warn(`BK215 connection lost: ${reason}`);
-    });
+  private async createStates(): Promise<void> {
+    for (const ch of ["live", "today", "stats", "raw"]) {
+      await this.setObjectNotExistsAsync(ch, {
+        type: "channel",
+        common: { name: ch },
+        native: {},
+      });
+    }
+    for (const [id, d] of Object.entries(STATES)) {
+      await this.setObjectNotExistsAsync(id, {
+        type: "state",
+        common: {
+          name: d.name,
+          type: d.type,
+          role: d.role,
+          unit: d.unit,
+          read: true,
+          write: false,
+        },
+        native: {},
+      });
+    }
+  }
 
-    this.bk215.on("error", (err: Error) => {
-      this.log.debug(`BK215 transient error: ${err.message}`);
-    });
+  // ---------------------------------------------------------------- scheduling
 
-    this.bk215.on("data", (status: StatusSnapshot) => {
-      void this.publishStatus(status);
+  private interval(seconds: number, min: number, fallback: number): number {
+    const s = Number(seconds);
+    return Math.max(min, Number.isFinite(s) && s > 0 ? s : fallback) * 1000;
+  }
+
+  private scheduleLive(ms: number): void {
+    this.liveTimer = this.setTimeout(() => void this.liveTick(), ms);
+  }
+
+  private scheduleStats(ms: number): void {
+    this.statsTimer = this.setTimeout(() => void this.statsTick(), ms);
+  }
+
+  private backoff(base: number, fails: number): number {
+    return Math.min(base * 2 ** Math.max(0, fails - 1), MAX_BACKOFF_MS);
+  }
+
+  private async liveTick(): Promise<void> {
+    const base = this.interval(this.cfg.pollLiveS, 30, 60);
+    try {
+      await this.readLive();
+      this.liveFails = 0;
+      this.scheduleLive(base);
+    } catch (e) {
+      this.liveFails++;
+      await this.fail(e);
+      this.scheduleLive(this.backoff(base, this.liveFails));
+    }
+  }
+
+  private async statsTick(): Promise<void> {
+    const base = this.interval(this.cfg.pollStatsMin * 60, 5 * 60, 15 * 60);
+    try {
+      await this.readStats();
+      this.statsFails = 0;
+      this.scheduleStats(base);
+    } catch (e) {
+      this.statsFails++;
+      await this.fail(e);
+      this.scheduleStats(this.backoff(base, this.statsFails));
+    }
+  }
+
+  private async fail(e: unknown): Promise<void> {
+    const msg = (e as Error).message || String(e);
+    await this.setStateAsync("info.connection", { val: false, ack: true });
+    await this.setStateAsync("info.lastError", { val: msg, ack: true });
+    // one warning per kind of problem, the repeats on debug
+    if (msg !== this.lastErrorLogged) {
+      this.log.warn(`Sunlit-Cloud: ${msg}`);
+      this.lastErrorLogged = msg;
+    } else {
+      this.log.debug(`Sunlit-Cloud: ${msg}`);
+    }
+    if (e instanceof CloudAuthError) {
+      this.cloud?.logout();
+    }
+  }
+
+  private async ok(): Promise<void> {
+    await this.setStateAsync("info.connection", { val: true, ack: true });
+    await this.setStateAsync("info.lastSync", { val: Date.now(), ack: true });
+    if (this.lastErrorLogged) {
+      this.log.info("Sunlit-Cloud: wieder erreichbar");
+      this.lastErrorLogged = "";
+      await this.setStateAsync("info.lastError", { val: "", ack: true });
+    }
+  }
+
+  // ---------------------------------------------------------------- reading
+
+  private async raw(id: string, v: unknown): Promise<void> {
+    await this.setStateAsync(`raw.${id}`, {
+      val: redactJson(v, SENSITIVE),
+      ack: true,
     });
   }
 
-  // -----------------------------------------------------------------------
-  // Scheduler callbacks
-  // -----------------------------------------------------------------------
-
-  private async onSchedulerTick(report: TickReport): Promise<void> {
-    const writes: Array<Promise<unknown>> = [];
-
-    if (report.error !== null) {
-      writes.push(
-        this.setStateAsync("controller.error", {
-          val: report.error,
-          ack: true,
-        }),
+  /** Space id and batteries, once (again after a restart) */
+  private async ensureSetup(): Promise<void> {
+    if (this.familyId) {
+      return;
+    }
+    const cloud = this.cloud!;
+    const families = await cloud.families();
+    await this.raw("families", families);
+    const wanted = Number(this.cfg.familyId) || 0;
+    const ids = (Array.isArray(families) ? families : [])
+      .map((f) => num(f.id) ?? num(f.familyId) ?? num(f.spaceId))
+      .filter((n): n is number => n !== null);
+    const id = wanted && ids.includes(wanted) ? wanted : ids[0];
+    if (!id) {
+      throw new Error("Keine Anlage (family) im Konto gefunden");
+    }
+    if (ids.length > 1 && !wanted) {
+      this.log.info(
+        `Mehrere Anlagen im Konto (${ids.join(", ")}), nehme ${id}; in den Einstellungen wählbar`,
       );
     }
-    if (report.integral !== null) {
-      writes.push(
-        this.setStateAsync("controller.integral", {
-          val: report.integral,
-          ack: true,
-        }),
-      );
+    const devices = await cloud.deviceList(id);
+    await this.raw("devices", devices);
+    this.batteryIds = batteries(Array.isArray(devices) ? devices : [])
+      .map((d) => num(d.deviceId))
+      .filter((n): n is number => n !== null);
+    this.familyId = id;
+    await this.setStateAsync("info.familyId", { val: id, ack: true });
+    this.log.info(
+      `Sunlit-Cloud verbunden: Anlage ${id}, ${this.batteryIds.length} Akku(s)`,
+    );
+  }
+
+  private async readLive(): Promise<void> {
+    await this.ensureSetup();
+    const cloud = this.cloud!;
+    const index = await cloud.spaceIndex(this.familyId);
+    await this.raw("index", index);
+
+    let battery: Json = {};
+    if (this.batteryIds.length) {
+      battery = await cloud.deviceStatistics(this.batteryIds[0]);
+      await this.raw("batteryStats", battery);
     }
-    writes.push(
-      this.setStateAsync("controller.lastUpdate", {
-        val: Date.now(),
-        ack: true,
-      }),
+    const v = liveValues(index ?? {}, battery ?? {});
+    const modules = v.batteryModules ?? 1;
+    const cfgCap = Number(this.cfg.batteryCapacityKwh);
+    this.capacityKwh = cfgCap > 0 ? cfgCap : modules * MODULE_KWH;
+    const eta = batteryEta(
+      v,
+      this.capacityKwh,
+      Number(this.cfg.minSoc) || 0,
+      Date.now(),
     );
 
-    await Promise.all(writes);
-  }
-
-  private async onFailSafeChange(
-    active: boolean,
-    reasonText: string | null,
-  ): Promise<void> {
+    const set = (
+      id: string,
+      val: ioBroker.StateValue | null,
+    ): Promise<unknown> => this.setStateAsync(id, { val, ack: true });
     await Promise.all([
-      this.setStateAsync("safety.failSafeActive", { val: active, ack: true }),
-      this.setStateAsync("safety.lastReason", {
-        val: reasonText ?? "",
+      set("live.soc", v.soc),
+      set("live.batteryW", v.batteryW),
+      set("live.batteryChargeW", v.batteryChargeW),
+      set("live.batteryDischargeW", v.batteryDischargeW),
+      set("live.solarW", v.solarW),
+      set("live.inverterW", v.inverterW),
+      set("live.meterW", v.meterW),
+      set("live.homeW", v.homeW),
+      set("live.chargeRemainingMin", v.chargeRemainingMin),
+      set("live.dischargeRemainingMin", v.dischargeRemainingMin),
+      set("live.fullAt", eta.fullAt),
+      set("live.emptyAt", eta.emptyAt),
+      set("live.batteryModules", v.batteryModules),
+      set("live.batteryStatus", v.batteryStatus),
+      set("live.batteryFault", v.batteryFault),
+      set("live.capacityKwh", this.capacityKwh),
+      set("today.solarKwh", v.todaySolarKwh),
+      set("today.earning", v.todayEarning),
+      set("today.currency", v.currency),
+    ]);
+    await this.ok();
+  }
+
+  private async readStats(): Promise<void> {
+    await this.ensureSetup();
+    const cloud = this.cloud!;
+    const id = this.familyId;
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = now.getMonth() + 1;
+    const prev = new Date(y, m - 2, 1);
+
+    // one after the other: gentle on the cloud
+    const total = await cloud.staticStatistics(id);
+    const eAll = await cloud.energy(id);
+    const gAll = await cloud.earning(id);
+    const eYear = await cloud.energy(id, y);
+    const gYear = await cloud.earning(id, y);
+    const eMonth = await cloud.energy(id, y, m);
+    const gMonth = await cloud.earning(id, y, m);
+    const ePrev = await cloud.energy(
+      id,
+      prev.getFullYear(),
+      prev.getMonth() + 1,
+    );
+    const gPrev = await cloud.earning(
+      id,
+      prev.getFullYear(),
+      prev.getMonth() + 1,
+    );
+    const power = await cloud.dayPower(id, now);
+    const io = this.batteryIds.length
+      ? await cloud.batteryIo(this.batteryIds[0], now)
+      : [];
+
+    await this.raw("energyMonth", eMonth);
+    await this.raw("earningMonth", gMonth);
+    await this.raw("dayPower", power);
+    await this.raw("batteryIo", io);
+
+    const js = (v: unknown): string => JSON.stringify(v);
+    const o = (v: unknown): Json =>
+      v && typeof v === "object" ? (v as Json) : {};
+    await Promise.all([
+      this.setStateAsync("stats.total", { val: js(redact(total)), ack: true }),
+      this.setStateAsync("stats.years", {
+        val: js(buckets(o(eAll), o(gAll))),
         ack: true,
       }),
+      this.setStateAsync("stats.yearTotals", {
+        val: js(periodTotals(o(eAll), o(gAll))),
+        ack: true,
+      }),
+      this.setStateAsync("stats.months", {
+        val: js(buckets(o(eYear), o(gYear))),
+        ack: true,
+      }),
+      this.setStateAsync("stats.monthTotals", {
+        val: js(periodTotals(o(eYear), o(gYear))),
+        ack: true,
+      }),
+      this.setStateAsync("stats.days", {
+        val: js(buckets(o(eMonth), o(gMonth))),
+        ack: true,
+      }),
+      this.setStateAsync("stats.dayTotals", {
+        val: js(periodTotals(o(eMonth), o(gMonth))),
+        ack: true,
+      }),
+      this.setStateAsync("stats.daysPrev", {
+        val: js(buckets(o(ePrev), o(gPrev))),
+        ack: true,
+      }),
+      this.setStateAsync("today.curve", {
+        val: js(dayCurve(o(power), io)),
+        ack: true,
+      }),
+      this.setStateAsync("stats.updated", { val: Date.now(), ack: true }),
     ]);
+    await this.ok();
   }
 
-  // -----------------------------------------------------------------------
-  // State change handler
-  // -----------------------------------------------------------------------
-
-  private async onStateChange(
-    id: string,
-    state: ioBroker.State | null | undefined,
-  ): Promise<void> {
-    if (!state || state.ack) {
-      return;
-    }
-
-    const local = id.startsWith(`${this.namespace}.`)
-      ? id.slice(this.namespace.length + 1)
-      : id;
-    this.log.debug(
-      `State change request: ${local} -> ${JSON.stringify(state.val)}`,
-    );
-
+  private onUnload(callback: () => void): void {
     try {
-      // Controller toggle is independent of the BK215 client.
-      if (local === "controller.enabled") {
-        if (this.scheduler) {
-          if (state.val) {
-            this.scheduler.start();
-          } else {
-            await this.scheduler.stop();
-          }
-          await this.setStateAsync("controller.enabled", {
-            val: !!state.val,
-            ack: true,
-          });
-        } else {
-          this.log.warn("Cannot toggle controller — scheduler not initialised");
-        }
-        return;
+      if (this.liveTimer) {
+        this.clearTimeout(this.liveTimer);
       }
-
-      if (!this.bk215) {
-        this.log.warn(
-          `State change ignored — BK215 client not initialised: ${id}`,
-        );
-        return;
+      if (this.statsTimer) {
+        this.clearTimeout(this.statsTimer);
       }
-
-      switch (local) {
-        case "battery.chargingPowerSetpoint":
-          await this.bk215.setChargingPower(Number(state.val));
-          break;
-        case "battery.localMode":
-          await (state.val
-            ? this.bk215.enableLocalMode()
-            : this.bk215.disableLocalMode());
-          break;
-        case "battery.homeApplianceMode":
-          await (state.val
-            ? this.bk215.enableHomeApplianceMode()
-            : this.bk215.disableHomeApplianceMode());
-          break;
-        case "battery.socMinLimit":
-          await this.bk215.setMinDischargeSoc(Number(state.val));
-          break;
-        case "battery.socMaxLimit":
-          await this.bk215.setMaxChargeSoc(Number(state.val));
-          break;
-        default:
-          this.log.debug(`Unhandled writable state: ${local}`);
-          return;
-      }
-
-      await this.setStateAsync(local, { val: state.val, ack: true });
-    } catch (err) {
-      if (err instanceof BK215CommandError) {
-        this.log.error(
-          `Device rejected ${err.field}: errorCode=${err.errorCode}`,
-        );
-      } else {
-        this.log.error(`Failed to apply ${local}: ${(err as Error).message}`);
-      }
-    }
-  }
-
-  // -----------------------------------------------------------------------
-  // Helpers
-  // -----------------------------------------------------------------------
-
-  private async publishStatus(status: StatusSnapshot): Promise<void> {
-    const writes: Array<Promise<unknown>> = [];
-
-    const mirror = (stateId: string, raw: number | undefined): void => {
-      if (isAvailable(raw)) {
-        writes.push(this.setStateAsync(stateId, { val: raw, ack: true }));
-      }
-    };
-
-    mirror("battery.soc", status[Field.OverallSoc]);
-    mirror("battery.chargingPower", status[Field.SystemChargingPower]);
-    mirror("battery.socMinLimit", status[Field.SystemDischargeLimit]);
-    mirror("battery.socMaxLimit", status[Field.SystemChargeLimit]);
-
-    const localMode = status[Field.LocalMode];
-    if (typeof localMode === "number") {
-      writes.push(
-        this.setStateAsync("battery.localMode", {
-          val: localMode === 1,
-          ack: true,
-        }),
-      );
-    }
-    const homeMode = status[Field.HomeApplianceMode];
-    if (typeof homeMode === "number") {
-      writes.push(
-        this.setStateAsync("battery.homeApplianceMode", {
-          val: homeMode === 1,
-          ack: true,
-        }),
-      );
-    }
-
-    writes.push(
-      this.setStateAsync("info.lastSync", { val: Date.now(), ack: true }),
-    );
-
-    await Promise.all(writes);
-  }
-
-  private async readNumber(stateId: string, fallback: number): Promise<number> {
-    try {
-      const s = await this.getStateAsync(stateId);
-      const v = Number(s?.val);
-      return Number.isFinite(v) ? v : fallback;
-    } catch {
-      return fallback;
-    }
-  }
-
-  /**
-   * Best-effort 10-second mDNS scan for a BK215 on the LAN. If a serial
-   * number is configured, devices whose advertised serial does not match
-   * are skipped — useful when there are multiple BK215s on the same LAN.
-   */
-  private async discoverBk215Host(): Promise<string> {
-    let devices: DiscoveredDevice[];
-    try {
-      devices = await BK215Discovery.scanOnce(
-        10_000,
-        {
-          logger: {
-            debug: (m) => this.log.debug(`[mdns] ${m}`),
-            info: (m) => this.log.info(`[mdns] ${m}`),
-            warn: (m) => this.log.warn(`[mdns] ${m}`),
-          },
-        },
-        this.adapterTimerService(),
-      );
-    } catch (err) {
-      this.log.warn(`mDNS discovery failed: ${(err as Error).message}`);
-      return "";
-    }
-
-    const wantSerial = (this.cfg.bk215Serial ?? "").trim();
-    const candidates = wantSerial
-      ? devices.filter(
-          (d) => d.serial.toLowerCase() === wantSerial.toLowerCase(),
-        )
-      : devices;
-
-    const chosen = candidates.find((d) =>
-      /^(?:\d{1,3}\.){3}\d{1,3}$/.test(d.address),
-    );
-    return chosen ? chosen.address : "";
-  }
-
-  private async onUnload(callback: () => void): Promise<void> {
-    try {
-      this.log.info("Shutting down BK215 adapter…");
-
-      if (this.scheduler) {
-        await this.scheduler.stop();
-        this.scheduler = null;
-      }
-
-      if (this.grid) {
-        await this.grid.stop();
-        this.grid = null;
-      }
-
-      if (this.bk215) {
-        await this.bk215.destroy();
-        this.bk215 = null;
-      }
-
-      await this.setStateAsync("info.connection", { val: false, ack: true });
-    } catch (err) {
-      this.log.warn(
-        `Error during shutdown: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      void this.setState("info.connection", { val: false, ack: true });
     } finally {
       callback();
     }

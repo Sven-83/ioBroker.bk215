@@ -20,7 +20,12 @@ function obj(v: unknown): Json {
   return v && typeof v === "object" && !Array.isArray(v) ? (v as Json) : {};
 }
 
-/** First string among the values, else the fallback */
+/**
+ * First string among the values, else the fallback
+ *
+ * @param fallback
+ * @param values
+ */
 function str(fallback: string, ...values: unknown[]): string {
   for (const v of values) {
     if (typeof v === "string" && v) {
@@ -61,6 +66,11 @@ export interface LiveValues {
   homeW: number | null;
   chargeRemainingMin: number | null;
   dischargeRemainingMin: number | null;
+  /** grid energy from the meter linked in the app, kWh */
+  gridBuyTodayKwh: number | null;
+  gridRetTodayKwh: number | null;
+  gridBuyTotalKwh: number | null;
+  gridRetTotalKwh: number | null;
   todaySolarKwh: number | null;
   todayEarning: number | null;
   currency: string;
@@ -101,10 +111,41 @@ export function solarFromBattery(stats: Json): number | null {
 }
 
 /**
+ * Device list as returned by /v1.2/device/list: a page object ({content: [...]})
+ * or, in older answers, the array itself.
+ *
+ * @param answer
+ */
+export function deviceArray(answer: unknown): Json[] {
+  if (Array.isArray(answer)) {
+    return answer.filter((x) => x && typeof x === "object") as Json[];
+  }
+  const c = obj(answer).content;
+  return Array.isArray(c)
+    ? (c.filter((x) => x && typeof x === "object") as Json[])
+    : [];
+}
+
+/**
+ * The cloud reports the remaining time in hours (35.8 = 35 h 49 min)
+ *
+ * @param h
+ */
+function hoursToMin(h: number | null): number | null {
+  return h === null ? null : Math.round(h * 60);
+}
+
+/**
  * @param index   content of /v1.5/space/index
  * @param battery merged device-list entry + device statistics of the battery (or {})
+ * @param meter   device-list entry of the grid meter (or {})
+ * @param meterDevice
  */
-export function liveValues(index: Json, battery: Json): LiveValues {
+export function liveValues(
+  index: Json,
+  battery: Json,
+  meterDevice: Json = {},
+): LiveValues {
   const b = obj(index.battery);
   const inv = obj(index.inverter);
   const meter = obj(index.eleMeter);
@@ -128,10 +169,16 @@ export function liveValues(index: Json, battery: Json): LiveValues {
     inverterW: pick(inv, "currentPower"),
     meterW: pick(meter, "totalAcPower"),
     homeW: pick(today, "homePower"),
-    chargeRemainingMin:
+    chargeRemainingMin: hoursToMin(
       pick(b, "chargingRemaining") ?? pick(battery, "chargeRemaining"),
-    dischargeRemainingMin:
+    ),
+    dischargeRemainingMin: hoursToMin(
       pick(b, "dischargingRemaining") ?? pick(battery, "dischargeRemaining"),
+    ),
+    gridBuyTodayKwh: pick(meterDevice, "dailyBuyEnergy"),
+    gridRetTodayKwh: pick(meterDevice, "dailyRetEnergy"),
+    gridBuyTotalKwh: pick(meterDevice, "totalBuyEnergy"),
+    gridRetTotalKwh: pick(meterDevice, "totalRetEnergy"),
     todaySolarKwh: pick(today, "yield"),
     todayEarning:
       pick(obj(today.earning), "earnings", "amount") ?? pick(today, "earning"),

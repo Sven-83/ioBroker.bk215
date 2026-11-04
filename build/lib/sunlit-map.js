@@ -8,6 +8,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.num = num;
 exports.batteries = batteries;
 exports.solarFromBattery = solarFromBattery;
+exports.deviceArray = deviceArray;
 exports.liveValues = liveValues;
 exports.buckets = buckets;
 exports.periodTotals = periodTotals;
@@ -25,7 +26,12 @@ function num(v) {
 function obj(v) {
     return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
-/** First string among the values, else the fallback */
+/**
+ * First string among the values, else the fallback
+ *
+ * @param fallback
+ * @param values
+ */
 function str(fallback, ...values) {
     for (const v of values) {
         if (typeof v === "string" && v) {
@@ -77,10 +83,35 @@ function solarFromBattery(stats) {
     return seen ? sum : null;
 }
 /**
+ * Device list as returned by /v1.2/device/list: a page object ({content: [...]})
+ * or, in older answers, the array itself.
+ *
+ * @param answer
+ */
+function deviceArray(answer) {
+    if (Array.isArray(answer)) {
+        return answer.filter((x) => x && typeof x === "object");
+    }
+    const c = obj(answer).content;
+    return Array.isArray(c)
+        ? c.filter((x) => x && typeof x === "object")
+        : [];
+}
+/**
+ * The cloud reports the remaining time in hours (35.8 = 35 h 49 min)
+ *
+ * @param h
+ */
+function hoursToMin(h) {
+    return h === null ? null : Math.round(h * 60);
+}
+/**
  * @param index   content of /v1.5/space/index
  * @param battery merged device-list entry + device statistics of the battery (or {})
+ * @param meter   device-list entry of the grid meter (or {})
+ * @param meterDevice
  */
-function liveValues(index, battery) {
+function liveValues(index, battery, meterDevice = {}) {
     const b = obj(index.battery);
     const inv = obj(index.inverter);
     const meter = obj(index.eleMeter);
@@ -99,8 +130,12 @@ function liveValues(index, battery) {
         inverterW: pick(inv, "currentPower"),
         meterW: pick(meter, "totalAcPower"),
         homeW: pick(today, "homePower"),
-        chargeRemainingMin: pick(b, "chargingRemaining") ?? pick(battery, "chargeRemaining"),
-        dischargeRemainingMin: pick(b, "dischargingRemaining") ?? pick(battery, "dischargeRemaining"),
+        chargeRemainingMin: hoursToMin(pick(b, "chargingRemaining") ?? pick(battery, "chargeRemaining")),
+        dischargeRemainingMin: hoursToMin(pick(b, "dischargingRemaining") ?? pick(battery, "dischargeRemaining")),
+        gridBuyTodayKwh: pick(meterDevice, "dailyBuyEnergy"),
+        gridRetTodayKwh: pick(meterDevice, "dailyRetEnergy"),
+        gridBuyTotalKwh: pick(meterDevice, "totalBuyEnergy"),
+        gridRetTotalKwh: pick(meterDevice, "totalRetEnergy"),
         todaySolarKwh: pick(today, "yield"),
         todayEarning: pick(obj(today.earning), "earnings", "amount") ?? pick(today, "earning"),
         currency: str("EUR", today.currency, obj(today.earning).currency),

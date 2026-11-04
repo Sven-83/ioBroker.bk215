@@ -164,6 +164,30 @@ const STATES = {
         role: "value",
         unit: "kWh",
     },
+    "today.gridBuyKwh": {
+        name: "Grid import today (meter in the app)",
+        type: "number",
+        role: "value.energy.consumed",
+        unit: "kWh",
+    },
+    "today.gridRetKwh": {
+        name: "Grid export today (meter in the app)",
+        type: "number",
+        role: "value.energy.produced",
+        unit: "kWh",
+    },
+    "total.gridBuyKwh": {
+        name: "Grid import total (meter in the app)",
+        type: "number",
+        role: "value.energy.consumed",
+        unit: "kWh",
+    },
+    "total.gridRetKwh": {
+        name: "Grid export total (meter in the app)",
+        type: "number",
+        role: "value.energy.produced",
+        unit: "kWh",
+    },
     "today.solarKwh": {
         name: "Solar yield today",
         type: "number",
@@ -284,6 +308,7 @@ class Bk215Adapter extends utils.Adapter {
     async onReady() {
         await this.setStateAsync("info.connection", { val: false, ack: true });
         await this.createStates();
+        await this.setStateAsync("info.lastError", { val: "", ack: true });
         const { cloudEmail, cloudPassword } = this.cfg;
         if (!cloudEmail || !cloudPassword) {
             this.log.error("Sunlit-Cloud: E-Mail und Passwort in den Adapter-Einstellungen eintragen");
@@ -298,7 +323,7 @@ class Bk215Adapter extends utils.Adapter {
         this.scheduleStats(5_000);
     }
     async createStates() {
-        for (const ch of ["live", "today", "stats", "raw"]) {
+        for (const ch of ["live", "today", "total", "stats", "raw"]) {
             await this.setObjectNotExistsAsync(ch, {
                 type: "channel",
                 common: { name: ch },
@@ -411,9 +436,8 @@ class Bk215Adapter extends utils.Adapter {
         if (ids.length > 1 && !wanted) {
             this.log.info(`Mehrere Anlagen im Konto (${ids.join(", ")}), nehme ${id}; in den Einstellungen wählbar`);
         }
-        const devices = await cloud.deviceList(id);
-        await this.raw("devices", devices);
-        this.batteryIds = (0, sunlit_map_1.batteries)(Array.isArray(devices) ? devices : [])
+        const devices = (0, sunlit_map_1.deviceArray)(await cloud.deviceList(id));
+        this.batteryIds = (0, sunlit_map_1.batteries)(devices)
             .map((d) => (0, sunlit_map_1.num)(d.deviceId))
             .filter((n) => n !== null);
         this.familyId = id;
@@ -425,12 +449,19 @@ class Bk215Adapter extends utils.Adapter {
         const cloud = this.cloud;
         const index = await cloud.spaceIndex(this.familyId);
         await this.raw("index", index);
-        let battery = {};
+        // the device list carries the meter's energy counters and the battery's own fields
+        const listAnswer = await cloud.deviceList(this.familyId);
+        await this.raw("devices", listAnswer);
+        const devices = (0, sunlit_map_1.deviceArray)(listAnswer);
+        const batteryDevice = (0, sunlit_map_1.batteries)(devices)[0] ?? {};
+        const meterDevice = devices.find((d) => /METER/i.test(typeof d.deviceType === "string" ? d.deviceType : "")) ?? {};
+        let battery = { ...batteryDevice };
         if (this.batteryIds.length) {
-            battery = await cloud.deviceStatistics(this.batteryIds[0]);
-            await this.raw("batteryStats", battery);
+            const stats = await cloud.deviceStatistics(this.batteryIds[0]);
+            await this.raw("batteryStats", stats);
+            battery = { ...batteryDevice, ...(stats ?? {}) };
         }
-        const v = (0, sunlit_map_1.liveValues)(index ?? {}, battery ?? {});
+        const v = (0, sunlit_map_1.liveValues)(index ?? {}, battery, meterDevice);
         const modules = v.batteryModules ?? 1;
         const cfgCap = Number(this.cfg.batteryCapacityKwh);
         this.capacityKwh = cfgCap > 0 ? cfgCap : modules * MODULE_KWH;
@@ -453,6 +484,10 @@ class Bk215Adapter extends utils.Adapter {
             set("live.batteryStatus", v.batteryStatus),
             set("live.batteryFault", v.batteryFault),
             set("live.capacityKwh", this.capacityKwh),
+            set("today.gridBuyKwh", v.gridBuyTodayKwh),
+            set("today.gridRetKwh", v.gridRetTodayKwh),
+            set("total.gridBuyKwh", v.gridBuyTotalKwh),
+            set("total.gridRetKwh", v.gridRetTotalKwh),
             set("today.solarKwh", v.todaySolarKwh),
             set("today.earning", v.todayEarning),
             set("today.currency", v.currency),

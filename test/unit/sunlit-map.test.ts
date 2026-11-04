@@ -3,6 +3,7 @@ import { expect } from "chai";
 import {
   batteries,
   batteryEta,
+  deviceArray,
   buckets,
   dayCurve,
   liveValues,
@@ -42,7 +43,7 @@ describe("sunlit-map", () => {
           batteryLevel: 64,
           inputPower: 0,
           outputPower: 380,
-          dischargingRemaining: 240,
+          dischargingRemaining: 4,
           batteryCount: 2,
           deviceStatus: "Online",
         },
@@ -206,5 +207,45 @@ describe("sunlit-map", () => {
         now,
       ),
     ).to.deep.equal({ fullAt: null, emptyAt: null });
+  });
+
+  it("unpacks the paged device list and reads the meter counters", () => {
+    const list = deviceArray({
+      content: [
+        {
+          deviceType: "SHELLY_PRO3EM_METER",
+          dailyBuyEnergy: 9.17,
+          dailyRetEnergy: 0,
+          totalBuyEnergy: 6706.92,
+          totalRetEnergy: 19.8,
+        },
+        {
+          deviceType: "ENERGY_STORAGE_BATTERY",
+          deviceId: 63021,
+          batteryLevel: 21,
+        },
+      ],
+      totalPages: 1,
+    });
+    expect(list).to.have.length(2);
+    expect(deviceArray([{ a: 1 }])).to.have.length(1);
+    expect(deviceArray(null)).to.deep.equal([]);
+    const v = liveValues({}, list[1], list[0]);
+    expect(v).to.include({
+      gridBuyTodayKwh: 9.17,
+      gridRetTodayKwh: 0,
+      gridBuyTotalKwh: 6706.92,
+      gridRetTotalKwh: 19.8,
+      soc: 21,
+    });
+  });
+
+  it("converts the remaining time from hours to minutes", () => {
+    const v = liveValues(
+      { battery: { dischargingRemaining: 35.82, chargingRemaining: null } },
+      {},
+    );
+    expect(v.dischargeRemainingMin).to.equal(2149);
+    expect(v.chargeRemainingMin).to.equal(null);
   });
 });

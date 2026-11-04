@@ -36,6 +36,7 @@ inverter output, home consumption and energy statistics per day, month and year.
 | `live.homeW` | home consumption (W) |
 | `live.fullAt`, `live.emptyAt` | expected time full / empty (cloud minutes, else estimated) |
 | `today.solarKwh`, `today.earning` | yield and earnings today |
+| `today.gridBuyKwh`, `today.gridRetKwh`, `total.gridBuyKwh`, `total.gridRetKwh` | grid import / export of the meter linked in the app (kWh) |
 | `today.curve` | JSON `[{t, solarW, homeW, batteryInW, batteryOutW}]`, about every 2 min |
 | `stats.days`, `stats.daysPrev`, `stats.months`, `stats.years` | JSON per day of this/previous month, per month of this year, per year |
 | `stats.dayTotals`, `stats.monthTotals`, `stats.yearTotals`, `stats.total` | totals incl. self-use and self-sufficiency rate |

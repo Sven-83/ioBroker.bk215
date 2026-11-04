@@ -20,6 +20,11 @@ export interface LiveValues {
     homeW: number | null;
     chargeRemainingMin: number | null;
     dischargeRemainingMin: number | null;
+    /** grid energy from the meter linked in the app, kWh */
+    gridBuyTodayKwh: number | null;
+    gridRetTodayKwh: number | null;
+    gridBuyTotalKwh: number | null;
+    gridRetTotalKwh: number | null;
     todaySolarKwh: number | null;
     todayEarning: number | null;
     currency: string;
@@ -40,10 +45,19 @@ export declare function batteries(devices: Json[]): Json[];
  */
 export declare function solarFromBattery(stats: Json): number | null;
 /**
+ * Device list as returned by /v1.2/device/list: a page object ({content: [...]})
+ * or, in older answers, the array itself.
+ *
+ * @param answer
+ */
+export declare function deviceArray(answer: unknown): Json[];
+/**
  * @param index   content of /v1.5/space/index
  * @param battery merged device-list entry + device statistics of the battery (or {})
+ * @param meter   device-list entry of the grid meter (or {})
+ * @param meterDevice
  */
-export declare function liveValues(index: Json, battery: Json): LiveValues;
+export declare function liveValues(index: Json, battery: Json, meterDevice?: Json): LiveValues;
 export interface Bucket {
     /** day of month, month of year or year, depending on the request */
     key: number;

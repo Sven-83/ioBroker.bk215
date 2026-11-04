@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ## __WORK IN PROGRESS__
 -->
 
+## 0.2.0 (2026-11-04)
+
+### Changed
+- Reads the BK215 from the SunEnergyXT cloud (app login) instead of the local TCP interface; no local mode needed
+- Read-only: battery level and power, solar, inverter, home, grid meter, full/empty estimate, intraday curve, statistics per day/month/year
+
+### Removed
+- Local TCP client, mDNS discovery, PI zero-feed-in controller and safety guard (the controller wrote t590, which is the charging power limit, not a discharge setpoint)
+- Unused options (APS inverter, cloud token, log level) and personal default values
+
+
 ## 0.0.1 - 2026-04-25
 
 ### Added

@@ -110,6 +110,60 @@ export function solarFromBattery(stats: Json): number | null {
   return seen ? sum : null;
 }
 
+export interface Mppt {
+  /** e.g. "batteryMppt1Data" (head unit) or "battery2MpptData" (module 2) */
+  id: string;
+  /** name given in the app */
+  name: string;
+  w: number | null;
+  v: number | null;
+  a: number | null;
+}
+
+/**
+ * The solar inputs one by one, with the names given in the app
+ *
+ * @param stats
+ */
+export function mpptList(stats: Json): Mppt[] {
+  const out: Mppt[] = [];
+  for (const [k, v] of Object.entries(stats)) {
+    if (!/^battery\d*Mppt\d*Data$/i.test(k) || !v || typeof v !== "object") {
+      continue;
+    }
+    const o = v as Json;
+    out.push({
+      id: k,
+      name: str(k, o.mpptName),
+      w: num(o.batteryMpptInPower),
+      v: num(o.batteryMpptInVol),
+      a: num(o.batteryMpptInCur),
+    });
+  }
+  // head unit first, then the modules in order
+  const rank = (id: string): number => {
+    const m = /^battery(\d*)Mppt(\d*)Data$/i.exec(id);
+    return m ? (m[1] ? Number(m[1]) * 10 : 0) + (Number(m[2]) || 0) : 999;
+  };
+  return out.sort((a, b) => rank(a.id) - rank(b.id));
+}
+
+/**
+ * Charge level of the extension modules (battery1Soc … battery7Soc), present ones only
+ *
+ * @param stats
+ */
+export function moduleSocs(stats: Json): { module: number; soc: number }[] {
+  const out: { module: number; soc: number }[] = [];
+  for (let i = 1; i <= 7; i++) {
+    const soc = num(stats[`battery${i}Soc`]);
+    if (soc !== null) {
+      out.push({ module: i, soc });
+    }
+  }
+  return out;
+}
+
 /**
  * Device list as returned by /v1.2/device/list: a page object ({content: [...]})
  * or, in older answers, the array itself.

@@ -44,6 +44,30 @@ export declare function batteries(devices: Json[]): Json[];
  * @param stats
  */
 export declare function solarFromBattery(stats: Json): number | null;
+export interface Mppt {
+    /** e.g. "batteryMppt1Data" (head unit) or "battery2MpptData" (module 2) */
+    id: string;
+    /** name given in the app */
+    name: string;
+    w: number | null;
+    v: number | null;
+    a: number | null;
+}
+/**
+ * The solar inputs one by one, with the names given in the app
+ *
+ * @param stats
+ */
+export declare function mpptList(stats: Json): Mppt[];
+/**
+ * Charge level of the extension modules (battery1Soc … battery7Soc), present ones only
+ *
+ * @param stats
+ */
+export declare function moduleSocs(stats: Json): {
+    module: number;
+    soc: number;
+}[];
 /**
  * Device list as returned by /v1.2/device/list: a page object ({content: [...]})
  * or, in older answers, the array itself.

@@ -143,6 +143,16 @@ const STATES = {
         type: "number",
         role: "value.time",
     },
+    "live.mppt": {
+        name: "Solar inputs [{id, name, w, v, a}]",
+        type: "string",
+        role: "json",
+    },
+    "live.moduleSoc": {
+        name: "Charge level of the extension modules [{module, soc}]",
+        type: "string",
+        role: "json",
+    },
     "live.batteryModules": {
         name: "Battery modules",
         type: "number",
@@ -484,6 +494,8 @@ class Bk215Adapter extends utils.Adapter {
             set("live.batteryStatus", v.batteryStatus),
             set("live.batteryFault", v.batteryFault),
             set("live.capacityKwh", this.capacityKwh),
+            set("live.mppt", JSON.stringify((0, sunlit_map_1.mpptList)(battery))),
+            set("live.moduleSoc", JSON.stringify((0, sunlit_map_1.moduleSocs)(battery))),
             set("today.gridBuyKwh", v.gridBuyTodayKwh),
             set("today.gridRetKwh", v.gridRetTodayKwh),
             set("total.gridBuyKwh", v.gridBuyTotalKwh),

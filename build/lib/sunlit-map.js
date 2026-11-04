@@ -8,6 +8,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.num = num;
 exports.batteries = batteries;
 exports.solarFromBattery = solarFromBattery;
+exports.mpptList = mpptList;
+exports.moduleSocs = moduleSocs;
 exports.deviceArray = deviceArray;
 exports.liveValues = liveValues;
 exports.buckets = buckets;
@@ -81,6 +83,48 @@ function solarFromBattery(stats) {
         }
     }
     return seen ? sum : null;
+}
+/**
+ * The solar inputs one by one, with the names given in the app
+ *
+ * @param stats
+ */
+function mpptList(stats) {
+    const out = [];
+    for (const [k, v] of Object.entries(stats)) {
+        if (!/^battery\d*Mppt\d*Data$/i.test(k) || !v || typeof v !== "object") {
+            continue;
+        }
+        const o = v;
+        out.push({
+            id: k,
+            name: str(k, o.mpptName),
+            w: num(o.batteryMpptInPower),
+            v: num(o.batteryMpptInVol),
+            a: num(o.batteryMpptInCur),
+        });
+    }
+    // head unit first, then the modules in order
+    const rank = (id) => {
+        const m = /^battery(\d*)Mppt(\d*)Data$/i.exec(id);
+        return m ? (m[1] ? Number(m[1]) * 10 : 0) + (Number(m[2]) || 0) : 999;
+    };
+    return out.sort((a, b) => rank(a.id) - rank(b.id));
+}
+/**
+ * Charge level of the extension modules (battery1Soc … battery7Soc), present ones only
+ *
+ * @param stats
+ */
+function moduleSocs(stats) {
+    const out = [];
+    for (let i = 1; i <= 7; i++) {
+        const soc = num(stats[`battery${i}Soc`]);
+        if (soc !== null) {
+            out.push({ module: i, soc });
+        }
+    }
+    return out;
 }
 /**
  * Device list as returned by /v1.2/device/list: a page object ({content: [...]})

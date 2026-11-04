@@ -7,6 +7,8 @@ import {
   buckets,
   dayCurve,
   liveValues,
+  moduleSocs,
+  mpptList,
   num,
   periodTotals,
   solarFromBattery,
@@ -247,5 +249,38 @@ describe("sunlit-map", () => {
     );
     expect(v.dischargeRemainingMin).to.equal(2149);
     expect(v.chargeRemainingMin).to.equal(null);
+  });
+
+  it("lists the solar inputs with their names and the module levels", () => {
+    const stats = {
+      battery2MpptData: {
+        batteryMpptInPower: 50,
+        batteryMpptInVol: 30,
+        batteryMpptInCur: 1.6,
+        mpptName: "Garage",
+      },
+      batteryMppt2Data: { batteryMpptInPower: 80, mpptName: "West" },
+      batteryMppt1Data: { batteryMpptInPower: 120, mpptName: "Süd" },
+      battery4MpptData: null,
+      battery1Soc: 19,
+      battery2Soc: 20,
+      battery3Soc: null,
+    };
+    expect(mpptList(stats).map((m) => m.name)).to.deep.equal([
+      "Süd",
+      "West",
+      "Garage",
+    ]);
+    expect(mpptList(stats)[2]).to.deep.equal({
+      id: "battery2MpptData",
+      name: "Garage",
+      w: 50,
+      v: 30,
+      a: 1.6,
+    });
+    expect(moduleSocs(stats)).to.deep.equal([
+      { module: 1, soc: 19 },
+      { module: 2, soc: 20 },
+    ]);
   });
 });

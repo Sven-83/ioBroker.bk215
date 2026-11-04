@@ -23,6 +23,7 @@ import {
   dayCurve,
   liveValues,
   moduleSocs,
+  socLimits,
   mpptList,
   num,
   periodTotals,
@@ -146,6 +147,18 @@ const STATES: Record<string, StateDef> = {
     name: "Solar inputs [{id, name, w, v, a}]",
     type: "string",
     role: "json",
+  },
+  "live.minSoc": {
+    name: "Discharge limit set in the app",
+    type: "number",
+    role: "value.battery",
+    unit: "%",
+  },
+  "live.maxSoc": {
+    name: "Charge limit set in the app",
+    type: "number",
+    role: "value.battery",
+    unit: "%",
   },
   "live.moduleSoc": {
     name: "Charge level of each battery, main unit first [{module, name, soc}]",
@@ -501,12 +514,9 @@ class Bk215Adapter extends utils.Adapter {
     const modules = v.batteryModules ?? 1;
     const cfgCap = Number(this.cfg.batteryCapacityKwh);
     this.capacityKwh = cfgCap > 0 ? cfgCap : modules * MODULE_KWH;
-    const eta = batteryEta(
-      v,
-      this.capacityKwh,
-      Number(this.cfg.minSoc) || 0,
-      Date.now(),
-    );
+    const limits = socLimits(battery);
+    const minSoc = limits.minSoc ?? (Number(this.cfg.minSoc) || 0);
+    const eta = batteryEta(v, this.capacityKwh, minSoc, Date.now());
 
     const set = (
       id: string,
@@ -530,6 +540,8 @@ class Bk215Adapter extends utils.Adapter {
       set("live.batteryFault", v.batteryFault),
       set("live.capacityKwh", this.capacityKwh),
       set("live.mppt", JSON.stringify(mpptList(battery))),
+      set("live.minSoc", minSoc),
+      set("live.maxSoc", limits.maxSoc),
       set("live.moduleSoc", JSON.stringify(moduleSocs(battery))),
       set("today.gridBuyKwh", v.gridBuyTodayKwh),
       set("today.gridRetKwh", v.gridRetTodayKwh),

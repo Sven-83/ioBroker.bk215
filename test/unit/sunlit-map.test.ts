@@ -262,6 +262,7 @@ describe("sunlit-map", () => {
       batteryMppt2Data: { batteryMpptInPower: 80, mpptName: "West" },
       batteryMppt1Data: { batteryMpptInPower: 120, mpptName: "Süd" },
       battery4MpptData: null,
+      batterySoc: 22,
       battery1Soc: 19,
       battery2Soc: 20,
       battery3Soc: null,
@@ -279,8 +280,9 @@ describe("sunlit-map", () => {
       a: 1.6,
     });
     expect(moduleSocs(stats)).to.deep.equal([
-      { module: 1, soc: 19 },
-      { module: 2, soc: 20 },
+      { module: 1, name: "BK215", soc: 22 },
+      { module: 2, name: "B215 1", soc: 19 },
+      { module: 3, name: "B215 2", soc: 20 },
     ]);
   });
 });

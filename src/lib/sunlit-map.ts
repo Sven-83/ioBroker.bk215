@@ -149,16 +149,23 @@ export function mpptList(stats: Json): Mppt[] {
 }
 
 /**
- * Charge level of the extension modules (battery1Soc … battery7Soc), present ones only
+ * Charge level of every battery: the main unit's own pack (batterySoc, name "BK215") first,
+ * then the extension modules (battery1Soc … battery7Soc, name "B215 n"), present ones only
  *
  * @param stats
  */
-export function moduleSocs(stats: Json): { module: number; soc: number }[] {
-  const out: { module: number; soc: number }[] = [];
+export function moduleSocs(
+  stats: Json,
+): { module: number; name: string; soc: number }[] {
+  const out: { module: number; name: string; soc: number }[] = [];
+  const main = num(stats.batterySoc);
+  if (main !== null) {
+    out.push({ module: 1, name: "BK215", soc: main });
+  }
   for (let i = 1; i <= 7; i++) {
     const soc = num(stats[`battery${i}Soc`]);
     if (soc !== null) {
-      out.push({ module: i, soc });
+      out.push({ module: out.length + 1, name: `B215 ${i}`, soc });
     }
   }
   return out;

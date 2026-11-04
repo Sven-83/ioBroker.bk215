@@ -148,7 +148,7 @@ const STATES: Record<string, StateDef> = {
     role: "json",
   },
   "live.moduleSoc": {
-    name: "Charge level of the extension modules [{module, soc}]",
+    name: "Charge level of each battery, main unit first [{module, name, soc}]",
     type: "string",
     role: "json",
   },

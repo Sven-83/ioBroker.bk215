@@ -172,6 +172,24 @@ export function moduleSocs(
 }
 
 /**
+ * Charge limits set in the app (device list entry, batteryChargingBoxDto):
+ * minSoc = discharge limit (batPackParam.allowMinSoc, else evDodMinSoc), maxSoc = charge limit (chgDodMaxSoc)
+ *
+ * @param battery merged device-list entry of the battery
+ */
+export function socLimits(battery: Json): {
+  minSoc: number | null;
+  maxSoc: number | null;
+} {
+  const box = obj(battery.batteryChargingBoxDto);
+  return {
+    minSoc:
+      pick(obj(box.batPackParam), "allowMinSoc") ?? pick(box, "evDodMinSoc"),
+    maxSoc: pick(box, "chgDodMaxSoc"),
+  };
+}
+
+/**
  * Device list as returned by /v1.2/device/list: a page object ({content: [...]})
  * or, in older answers, the array itself.
  *

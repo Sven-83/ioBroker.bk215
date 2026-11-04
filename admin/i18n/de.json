@@ -14,5 +14,5 @@
   "label_batteryCapacityKwh": "Kapazität (kWh)",
   "help_batteryCapacityKwh": "0 = Module × 2,15 kWh",
   "label_minSoc": "Entlade-Untergrenze (%)",
-  "help_minSoc": "wie in der App eingestellt"
+  "help_minSoc": "nur falls die Cloud keinen Wert liefert (sonst gilt der Wert aus der App)"
 }

@@ -14,5 +14,5 @@
   "label_batteryCapacityKwh": "Capacity (kWh)",
   "help_batteryCapacityKwh": "0 = modules × 2.15 kWh",
   "label_minSoc": "Discharge floor (%)",
-  "help_minSoc": "as set in the app"
+  "help_minSoc": "only if the cloud sends no value (otherwise the value set in the app is used)"
 }

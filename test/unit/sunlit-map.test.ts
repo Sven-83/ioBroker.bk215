@@ -8,6 +8,7 @@ import {
   dayCurve,
   liveValues,
   moduleSocs,
+  socLimits,
   mpptList,
   num,
   periodTotals,
@@ -284,5 +285,24 @@ describe("sunlit-map", () => {
       { module: 2, name: "B215 1", soc: 19 },
       { module: 3, name: "B215 2", soc: 20 },
     ]);
+  });
+});
+
+describe("socLimits", () => {
+  it("reads the limits set in the app", () => {
+    expect(
+      socLimits({
+        batteryChargingBoxDto: {
+          batPackParam: { allowMinSoc: 20 },
+          haDodMinSoc: 5,
+          evDodMinSoc: 25,
+          chgDodMaxSoc: 90,
+        },
+      }),
+    ).to.deep.equal({ minSoc: 20, maxSoc: 90 });
+    expect(
+      socLimits({ batteryChargingBoxDto: { evDodMinSoc: 25 } }),
+    ).to.deep.equal({ minSoc: 25, maxSoc: null });
+    expect(socLimits({})).to.deep.equal({ minSoc: null, maxSoc: null });
   });
 });

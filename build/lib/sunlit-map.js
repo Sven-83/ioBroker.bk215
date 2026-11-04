@@ -10,6 +10,7 @@ exports.batteries = batteries;
 exports.solarFromBattery = solarFromBattery;
 exports.mpptList = mpptList;
 exports.moduleSocs = moduleSocs;
+exports.socLimits = socLimits;
 exports.deviceArray = deviceArray;
 exports.liveValues = liveValues;
 exports.buckets = buckets;
@@ -130,6 +131,19 @@ function moduleSocs(stats) {
         }
     }
     return out;
+}
+/**
+ * Charge limits set in the app (device list entry, batteryChargingBoxDto):
+ * minSoc = discharge limit (batPackParam.allowMinSoc, else evDodMinSoc), maxSoc = charge limit (chgDodMaxSoc)
+ *
+ * @param battery merged device-list entry of the battery
+ */
+function socLimits(battery) {
+    const box = obj(battery.batteryChargingBoxDto);
+    return {
+        minSoc: pick(obj(box.batPackParam), "allowMinSoc") ?? pick(box, "evDodMinSoc"),
+        maxSoc: pick(box, "chgDodMaxSoc"),
+    };
 }
 /**
  * Device list as returned by /v1.2/device/list: a page object ({content: [...]})

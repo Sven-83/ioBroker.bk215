@@ -9,13 +9,16 @@
  * complete `onReady` and either log "no host configured" or sit in the
  * reconnect loop. Either is fine — we only fail on hard crashes.
  *
- * Compact-mode safety: the second test stops and starts the adapter twice
- * in quick succession. If any timer or socket leaked, the harness would
- * see the second startup time out or throw.
+ * Shutdown: the second test stops the adapter and requires its process to end
+ * within a time limit. A harness can only start the adapter once, and the
+ * adapter runs in its own process here, so this does not cover compact mode.
  */
 
+import assert from "node:assert/strict";
 import path from "node:path";
 import { tests } from "@iobroker/testing";
+
+const STOP_LIMIT_MS = 10_000;
 
 tests.integration(path.join(__dirname, ".."), {
   // Exit code 11 = ioBroker convention for "missing config, do not restart".
@@ -32,20 +35,28 @@ tests.integration(path.join(__dirname, ".."), {
       });
     });
 
-    suite("Compact-Mode lifecycle (M4)", (getHarness) => {
-      it("survives a stop/start cycle without leaking resources", async function () {
-        this.timeout(120_000);
+    suite("Shutdown", (getHarness) => {
+      it("stops cleanly within the time limit", async function () {
+        this.timeout(60_000);
         const harness = getHarness();
 
-        // Start cycle 1
         await harness.startAdapterAndWait();
         await new Promise((r) => setTimeout(r, 5_000));
-        await harness.stopAdapter();
-        await new Promise((r) => setTimeout(r, 1_000));
+        assert.equal(
+          harness.isAdapterRunning(),
+          true,
+          "the adapter ended before it was stopped",
+        );
 
-        // Start cycle 2 — if anything leaked, this would hang or throw
-        await harness.startAdapterAndWait();
-        await new Promise((r) => setTimeout(r, 5_000));
+        await Promise.race([
+          harness.stopAdapter(),
+          new Promise((r) => setTimeout(r, STOP_LIMIT_MS)),
+        ]);
+        assert.equal(
+          harness.isAdapterRunning(),
+          false,
+          `the adapter still runs after ${STOP_LIMIT_MS} ms`,
+        );
       });
     });
   },
